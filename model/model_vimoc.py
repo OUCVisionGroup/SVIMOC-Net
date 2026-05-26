@@ -1,0 +1,228 @@
+import torch
+import torch.nn as nn
+import torch.utils.model_zoo as model_zoo
+from torch.nn import functional as F
+from timm.models.layers import trunc_normal_
+
+
+model_urls = {
+    'vgg16': 'https://download.pytorch.org/models/vgg16-397923af.pth',
+    'vgg19': 'https://download.pytorch.org/models/vgg19-dcbb9e9d.pth',
+}
+
+
+class VGG(nn.Module):
+    def __init__(self, features, num_classes):
+        super(VGG, self).__init__()
+        self.features = features
+        self.upsample1 = Upsample(512, 256, 256 + 512, 512)
+        self.upsample2 = Upsample(512, 256, 256 + 256, 512)
+        self.cls_head = nn.Sequential(nn.Conv2d(512, 512, 1, 1),
+                                      nn.ReLU(inplace=True),
+                                      nn.Conv2d(512, num_classes, 1, 1))
+
+        self.reg_head = nn.Sequential(nn.Conv2d(1024, 256, 3, 1, 1),
+                                      nn.ReLU(inplace=True),
+                                      nn.Conv2d(256, 128, 3, 1, 1),
+                                      nn.ReLU(inplace=True),
+                                      nn.Conv2d(128, 10, 1, 1),
+                                      nn.ReLU())
+        
+        self.depth_enhance = nn.Sequential(
+            nn.Conv2d(1024, 64, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 2, kernel_size=1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.depth_decoder = nn.Sequential(
+            nn.Conv2d(1024, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True), 
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True), 
+        )
+        
+        self.depth_head = nn.Sequential(
+            nn.Conv2d(64, 1, kernel_size=1),
+            nn.ReLU(inplace=True),
+        )
+        self.reg_layer1 = nn.Sequential(
+            nn.Conv2d(512, 256, kernel_size=3, padding=1),
+          
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+             
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+   
+            nn.ReLU(inplace=True),
+        )
+
+        self.reg_layer2 = nn.Sequential(
+            nn.Conv2d(512, 256, kernel_size=3, padding=2, dilation=2),
+     
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 128, kernel_size=3, padding=2, dilation=2),
+ 
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 64, kernel_size=3, padding=2, dilation=2),
+   
+            nn.ReLU(inplace=True),
+ 
+        )
+
+        self.reg_layer3 = nn.Sequential(
+            nn.Conv2d(512, 256, kernel_size=3, padding=3, dilation=3),
+       
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 128, kernel_size=3, padding=3, dilation=3),
+   
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 64, kernel_size=3, padding=3, dilation=3),
+   
+            nn.ReLU(inplace=True),
+          
+        )
+        
+        self.output_layer = nn.Sequential(nn.Conv2d(64, 10, 1, 1),
+                                      nn.ReLU(inplace=True))
+        
+        self.RGB_layer = nn.Sequential(
+            nn.Conv2d(1024, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),        
+        )
+
+        self.depth_layer = nn.Sequential(
+            nn.Conv2d(64, 512, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),  
+        )
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv2d):
+            nn.init.normal_(m.weight, std=0.01)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            m.weight.data.fill_(1.0)
+            m.bias.data.zero_()
+
+    def forward(self,prev_img,img):
+        
+        prev_img1 = self.features[: 19](prev_img)
+        prev_img2 = self.features[19: 28](prev_img1)
+        prev_img3 = self.features[28:](prev_img2)
+ 
+        feat_prev_img = self.upsample1(prev_img3, prev_img2)
+        prev_img = self.upsample2(feat_prev_img, prev_img1)
+ 
+        img1 = self.features[: 19](img)
+        img2 = self.features[19: 28](img1)
+        img3 = self.features[28:](img2)
+
+        feat_img = self.upsample1(img3, img2)
+        img = self.upsample2(feat_img, img1)
+
+        # prev_img = self.features(prev_img)
+        # img = self.features(img)
+
+        feat = torch.cat((prev_img,img),1) 
+
+        cls_score = self.cls_head(img)
+
+        # # Depth estimation branch
+        x_depth=self.depth_decoder(feat)
+        depth =self.depth_head(x_depth)
+        # #DEE
+        x_depth = self.depth_layer(x_depth)
+        x = self.RGB_layer(feat)
+
+        M = F.softmax(self.depth_enhance(torch.cat((x,x_depth),1)), dim=1)        
+        feat = x * M[:,0:1,:,:] + x_depth * M[:,1:2,:,:]
+
+        pred_den1 = self.reg_layer1(feat)
+        pred_den2 = self.reg_layer2(feat)
+        pred_den3 = self.reg_layer3(feat)
+        
+
+        pred_den = self.output_layer((pred_den1+pred_den2+pred_den3)/3)
+
+        # pred_den = self.reg_head(feat)
+
+        cls_score_max = cls_score.max(dim=1, keepdim=True)[0]
+        cls_score = cls_score - cls_score_max
+         
+        return pred_den, cls_score, depth
+        # Necessary when performing experiments on JHU-Crowd++, otherwise the neural network is able to handle the bad values
+        # return torch.clamp(pred_den, max=25), cls_score
+
+
+def make_layers(cfg, batch_norm=False):
+    layers = []
+    in_channels = 3
+    for v in cfg:
+        if v == 'M':
+            layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
+        else:
+            conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=1)
+            if batch_norm:
+                layers += [conv2d, nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
+            else:
+                layers += [conv2d, nn.ReLU(inplace=True)]
+            in_channels = v
+    return nn.Sequential(*layers)
+
+
+cfg = {
+    'A': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'M', 512, 512, 512],
+    'E': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 256, 'M', 512, 512, 512, 512, 'M', 512, 512, 512, 512, 'M']
+}
+
+
+class Upsample(nn.Module):
+    def __init__(self, up_in_ch, up_out_ch, cat_in_ch, cat_out_ch):
+        super(Upsample, self).__init__()
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.conv1 = nn.Sequential(*[nn.Conv2d(up_in_ch, up_out_ch, 3, 1, padding=1), nn.ReLU()])
+        self.conv2 = nn.Sequential(*[nn.Conv2d(cat_in_ch, cat_out_ch, 3, 1, padding=1), nn.ReLU(),
+                                     nn.Conv2d(cat_out_ch, cat_out_ch, 3, 1, padding=1), nn.ReLU()])
+
+    def forward(self, low, high):
+        low = self.up(low)
+        low = self.conv1(low)
+
+        x = torch.cat([high, low], dim=1)
+
+        x = self.conv2(x)
+        return x
+
+
+def vgg19(num_classes):
+    """VGG 19-layer model (configuration "E")
+        model pre-trained on ImageNet
+    """
+    model = VGG(make_layers(cfg['E']), num_classes)
+     
+    model.load_state_dict(model_zoo.load_url(model_urls['vgg19']), strict=False)
+    return model
+
+def vgg16(num_classes):
+    """VGG 16-layer model (configuration "A")
+        model pre-trained on ImageNet
+    """
+    model = VGG(make_layers(cfg['A']), num_classes)
+    
+    model.load_state_dict(model_zoo.load_url(model_urls['vgg16']), strict=False)
+    return model
