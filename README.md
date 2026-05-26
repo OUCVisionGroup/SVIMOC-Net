@@ -7,4 +7,4 @@ Pytorch 1.10.2
 Python 3.8.19
 
 ## Pre-train models
-You can download the model weights we provided [here](https://drive.google.com/drive/u/0/my-drive?hl=zh-cn)
+You can download the model weights we provided [here](https://drive.google.com/file/d/1IyTw042-mxeBfazlvnUxb4wUnPtdA8Lj/view?usp=drive_link)
